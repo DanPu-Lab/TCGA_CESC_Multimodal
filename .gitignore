@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Data files (too large and private)
+data/raw/
+data/processed/
+result/
+*.npz
+*.npy
+*.h5ad
+*.svs
+*.tsv
+
+# Model checkpoints
+*.pth
+*.pt
+*.pkl
+
+# Logs and status files
+*.log
+*.json
+svs_processing_status.json
+
+# Figures and plots
+*.png
+*.jpg
+*.pdf
+*.svg
+
+# OS junk files
+.DS_Store
+Thumbs.db
