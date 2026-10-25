@@ -66,7 +66,7 @@ def main():
         # Display the first frozen patch; save every patch CAM for inspection.
         raw = images[0].permute(1, 2, 0).numpy() * config.IMAGENET_STD + config.IMAGENET_MEAN
         raw = np.clip(raw, 0, 1)
-        overlay = .6*raw + .4*plt.get_cmap("viridis")(cams[0])[..., :3]
+        overlay = .6*raw + .4*plt.get_cmap("jet")(cams[0])[..., :3]
         fig, axes = plt.subplots(1, 2, figsize=(6, 3))
         axes[0].imshow(raw); axes[1].imshow(overlay)
         for ax in axes:
@@ -76,7 +76,7 @@ def main():
         plt.close(fig)
     (args.output / "selection.json").write_text(json.dumps(
         {"case_ids": selected, "seed": args.seed, "correct_predictions_only": True,
-         "colormap": "viridis", "opacity": .4, "percentile_normalisation": [5, 95],
+         "colormap": "jet", "opacity": .4, "percentile_normalisation": [5, 95],
          "scope": "unimodal image attribution, not cell-type or causal validation"}, indent=2), encoding="utf8")
 
 
