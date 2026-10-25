@@ -1,75 +1,56 @@
-import os
-import pandas as pd
+"""Overall-survival associations of reference C1/C2 annotations, not model predictions."""
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import argparse
+import json
 import numpy as np
-from lifelines import KaplanMeierFitter
+import pandas as pd
+from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
-from lifelines.utils import concordance_index
 import config
+from pipeline.data import read_labels
+
 
 def main():
-    save_dir = os.path.join(config.RESULT_DIR, "analysis/survival")
-    os.makedirs(save_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("survival", help="CSV: sample_id,OS.time (days),OS (0/1); one row per patient")
+    parser.add_argument("--data-dir", default=config.DATA_DIR)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    table = pd.read_csv(args.survival)
+    if not {"sample_id", "OS.time", "OS"} <= set(table) or table.sample_id.duplicated().any():
+        raise ValueError("Require unique patient sample_id,OS.time,OS")
+    table = table.merge(read_labels(args.data_dir).rename("label"), left_on="sample_id",
+                        right_index=True, validate="one_to_one")
+    for column in ["OS.time", "OS"]:
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+    valid = np.isfinite(table["OS.time"]) & (table["OS.time"] > 0) & table.OS.isin([0, 1])
+    included, excluded = table.loc[valid].copy(), table.loc[~valid].copy()
+    groups = [included.loc[included.label == label] for label in [0, 1]]
+    if any(g.empty for g in groups):
+        raise ValueError("Both reference subtypes are required")
+    logrank = logrank_test(groups[0]["OS.time"], groups[1]["OS.time"], groups[0].OS, groups[1].OS)
+    cox = CoxPHFitter().fit(included[["OS.time", "OS", "label"]], duration_col="OS.time", event_col="OS")
+    lower, upper = np.exp(cox.confidence_intervals_.loc["label"])
+    result = {"n": len(included), "C1": len(groups[0]), "C2": len(groups[1]),
+              "logrank_p_two_sided": float(logrank.p_value),
+              "HR_C2_vs_C1": float(cox.hazard_ratios_["label"]),
+              "HR_ci_low": float(lower), "HR_ci_high": float(upper),
+              "label_source": "pre_existing_reference_subtypes", "time_unit": "days"}
+    args.output.mkdir(parents=True, exist_ok=False)
+    for label, group in enumerate(groups):
+        km = KaplanMeierFitter().fit(group["OS.time"]/365.25, group.OS, label=f"C{label+1}")
+        for year in [1, 3, 5]:
+            result[f"C{label+1}_{year}yr_probability"] = float(km.predict(year))
+        km.survival_function_.to_csv(args.output / f"C{label+1}_kaplan_meier.csv")
+        km.confidence_interval_.to_csv(args.output / f"C{label+1}_survival_ci.csv")
+        km.event_table.to_csv(args.output / f"C{label+1}_event_table.csv")
+    included.to_csv(args.output / "included_survival_patients.csv", index=False)
+    excluded.to_csv(args.output / "excluded_survival_patients.csv", index=False)
+    (args.output / "survival_statistics.json").write_text(json.dumps(result, indent=2), encoding="utf8")
+    print(result)
 
-    surv = pd.read_csv(os.path.join(config.DATA_DIR, "TCGA-CESC.survival.tsv"), sep='\t')
-    labels = pd.read_csv(os.path.join(config.DATA_DIR, "labels/all_labels.csv"))
-    # Extract patient ID
-    surv['sample_id'] = surv['sample'].str.extract(r'(TCGA-[A-Z0-9]{2}-[A-Z0-9]{4})')
-    merged = surv.merge(labels, on='sample_id').dropna(subset=['OS.time', 'OS'])
-    merged = merged[merged['OS.time'] > 0]
-    merged['subtype'] = merged['label'].map({0: 'C1', 1: 'C2'})
-
-    # Log-rank test
-    c1 = merged[merged['subtype']=='C1']
-    c2 = merged[merged['subtype']=='C2']
-    if len(c1) > 0 and len(c2) > 0:
-        result = logrank_test(c1['OS.time'], c2['OS.time'], c1['OS'], c2['OS'])
-        p_value = result.p_value
-    else:
-        p_value = np.nan
-
-    # Cox regression
-    from lifelines import CoxPHFitter
-    cox_data = merged[['OS.time', 'OS', 'label']].copy()
-    cph = CoxPHFitter()
-    cph.fit(cox_data, duration_col='OS.time', event_col='OS')
-    hr = cph.hazard_ratios_['label']
-    hr_ci_lower, hr_ci_upper = np.exp(cph.confidence_intervals_.loc['label'])
-
-    # Survival rates
-    kmf = KaplanMeierFitter()
-    survival_rates = {}
-    for sub, data in [('C1', c1), ('C2', c2)]:
-        if len(data) > 0:
-            kmf.fit(data['OS.time']/365.25, data['OS'])
-            survival_rates[sub] = {'1yr': kmf.predict(1), '3yr': kmf.predict(3), '5yr': kmf.predict(5)}
-        else:
-            survival_rates[sub] = {'1yr': np.nan, '3yr': np.nan, '5yr': np.nan}
-
-    # Summary
-    summary = pd.DataFrame([{
-        'logrank_p': p_value,
-        'hazard_ratio': hr,
-        'hr_ci_lower': hr_ci_lower,
-        'hr_ci_upper': hr_ci_upper,
-        'c1_1yr': survival_rates['C1']['1yr'],
-        'c1_3yr': survival_rates['C1']['3yr'],
-        'c1_5yr': survival_rates['C1']['5yr'],
-        'c2_1yr': survival_rates['C2']['1yr'],
-        'c2_3yr': survival_rates['C2']['3yr'],
-        'c2_5yr': survival_rates['C2']['5yr'],
-    }])
-    summary.to_csv(os.path.join(save_dir, "statistical_summary.csv"), index=False)
-
-    # Save merged data
-    merged.to_csv(os.path.join(save_dir, "merged_survival_data.csv"), index=False)
-
-    # Generate report
-    with open(os.path.join(save_dir, "final_analysis_report.txt"), "w") as f:
-        f.write(f"Log-rank p-value: {p_value:.4f}\n")
-        f.write(f"Hazard Ratio (C2 vs C1): {hr:.3f} (95% CI {hr_ci_lower:.3f}-{hr_ci_upper:.3f})\n")
-        f.write(f"C1 5-year survival: {survival_rates['C1']['5yr']:.1%}\n")
-        f.write(f"C2 5-year survival: {survival_rates['C2']['5yr']:.1%}\n")
-    print("Survival analysis completed.")
 
 if __name__ == "__main__":
     main()

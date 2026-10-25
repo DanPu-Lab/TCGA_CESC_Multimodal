@@ -1,91 +1,73 @@
-import os
-import torch
-import numpy as np
+"""Evaluate frozen models; no fitting, model selection or threshold optimisation."""
+import argparse
+import json
+from pathlib import Path
 import pandas as pd
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, balanced_accuracy_score, roc_curve
+import numpy as np
 import config
-from models.image_model import ImageModel
-from models.gene_model import GeneModel
-from models.early_fusion_model import EarlyFusionModel
-from models.late_fusion_model import LateFusionModel
-from data.dataset import get_dataloaders
+from pipeline.artifacts import load_checkpoint, sha256_file
+from pipeline.data import read_ids, read_labels, check_partitions
+from pipeline.dataset import PatientDataset, loader, MODES
+from pipeline.engine import predict, seed_all
+from pipeline.metrics import classification_metrics, metric_intervals
 
-def evaluate(model, loader, model_type):
-    model.eval()
-    preds, labels, probs = [], [], []
-    with torch.no_grad():
-        for batch in loader:
-            if model_type == 'image':
-                x, y = batch
-                x = x.to(config.DEVICE)
-                out = model(x)
-            elif model_type == 'gene':
-                x, y = batch
-                x = x.to(config.DEVICE)
-                out = model(x)
-            elif model_type == 'early_fusion':
-                img, gene, y = batch
-                img, gene = img.to(config.DEVICE), gene.to(config.DEVICE)
-                out = model(img, gene)
-            elif model_type == 'late_fusion':
-                img, gene, y = batch
-                img, gene = img.to(config.DEVICE), gene.to(config.DEVICE)
-                out, _, _ = model(img, gene)
-            else:
-                raise ValueError
-            probs_batch = torch.softmax(out, dim=1).cpu().numpy()
-            preds_batch = probs_batch.argmax(1)
-            preds.extend(preds_batch)
-            labels.extend(y.numpy())
-            probs.extend(probs_batch)
-    acc = accuracy_score(labels, preds)
-    bal_acc = balanced_accuracy_score(labels, preds)
-    auc = roc_auc_score(labels, [p[1] for p in probs])
-    f1 = f1_score(labels, preds)
-    return acc, bal_acc, auc, f1, probs, labels
+
+def evaluate_cohort(data_dir, checkpoint_root, output, cohort="tcga", n_resamples=1000):
+    seed_all(config.RANDOM_SEED)
+    data_dir, checkpoint_root, output = map(Path, (data_dir, checkpoint_root, output))
+    labels = read_labels(data_dir)
+    ids = (read_ids(data_dir / "splits/test_ids.csv") if cohort == "tcga"
+           else sorted(labels.index.tolist()))
+    if output.exists():
+        raise FileExistsError("Evaluation output exists; previous results will not be overwritten")
+    loaded = {mode: load_checkpoint(checkpoint_root / f"{mode}_model/best_model.pth",
+                                    mode, config.DEVICE) for mode in MODES}
+    training_sets = [set(meta["training_ids"]) for _, _, meta in loaded.values()]
+    if any(x != training_sets[0] for x in training_sets):
+        raise ValueError("Models were not fitted on the same TCGA training patients")
+    for _, _, meta in loaded.values():
+        check_partitions(meta["training_ids"], ids)
+        if meta.get("stage") != "final":
+            raise ValueError("Cohort evaluation requires final models, not CV-fold checkpoints")
+        if cohort == "tcga" and set(meta["evaluation_ids"]) != set(ids):
+            raise ValueError("Held-out IDs differ from checkpoint provenance")
+    bags = PatientDataset(ids, "image", False, data_dir=data_dir, cohort=cohort).freeze_bags()
+    output.mkdir(parents=True)
+    np.savez_compressed(output / "frozen_patch_indices.npz", sample_ids=np.asarray(ids, dtype=str),
+                        patch_indices=np.stack([bags[sid] for sid in ids]))
+    metrics, provenance = [], {}
+    for mode in MODES:
+        model, scaler, meta = loaded[mode]
+        ds = PatientDataset(ids, mode, False, scaler=scaler, data_dir=data_dir, cohort=cohort,
+                            frozen_bags=bags)
+        pred = predict(model, loader(ds), mode, config.DEVICE)
+        pred.to_csv(output / f"{mode}_predictions.csv", index=False)
+        row = {"model": mode, **classification_metrics(pred.true, pred.pred_prob_C2)}
+        row.update(metric_intervals(pred.true, pred.pred_prob_C2, n_resamples=n_resamples))
+        metrics.append(row)
+        provenance[mode] = {"checkpoint_sha256": sha256_file(
+            checkpoint_root / f"{mode}_model/best_model.pth"),
+            "scaler_sha256": meta.get("scaler_sha256"), "prediction_rule": "argmax_C1_C2"}
+    pd.DataFrame(metrics).to_csv(output / "model_comparison.csv", index=False)
+    (output / "evaluation_metadata.json").write_text(json.dumps(
+        {"cohort": cohort, "patients": ids, "seed": config.RANDOM_SEED,
+         "n_resamples": n_resamples, "frozen_models": provenance}, indent=2), encoding="utf8")
+    return pd.DataFrame(metrics)
+
 
 def main():
-    os.makedirs(os.path.join(config.RESULT_DIR, "evaluation"), exist_ok=True)
-    dataloaders = get_dataloaders()
-    test_loaders = {m: dataloaders[m]['test'] for m in ['image', 'gene', 'early_fusion', 'late_fusion']}
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default=config.DATA_DIR)
+    parser.add_argument("--checkpoint-root", default=config.RESULT_DIR)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--cohort", choices=["tcga", "cgci"], default="tcga")
+    parser.add_argument("--bootstrap", type=int, default=1000)
+    args = parser.parse_args()
+    if args.bootstrap < 100:
+        parser.error("--bootstrap must be at least 100")
+    print(evaluate_cohort(args.data_dir, args.checkpoint_root, args.output,
+                          args.cohort, args.bootstrap).to_string(index=False))
 
-    # Get gene input dimension
-    input_dim = next(iter(test_loaders['gene']))[0].shape[1]
-
-    models = {
-        'image': ImageModel().to(config.DEVICE),
-        'gene': GeneModel(input_dim).to(config.DEVICE),
-        'early_fusion': EarlyFusionModel(input_dim).to(config.DEVICE),
-        'late_fusion': LateFusionModel(input_dim).to(config.DEVICE)
-    }
-    for name, model in models.items():
-        path = os.path.join(config.RESULT_DIR, f"{name}_model/best_model.pth")
-        if os.path.exists(path):
-            state = torch.load(path, map_location='cpu')
-            # Remove 'module.' prefix if present
-            state = {k.replace('module.', ''): v for k, v in state.items()}
-            model.load_state_dict(state)
-            print(f"Loaded {name} model")
-
-    results = {}
-    for name, model in models.items():
-        print(f"\nEvaluating {name}...")
-        acc, bal_acc, auc, f1, probs, labels = evaluate(model, test_loaders[name], name)
-        results[name] = {'accuracy': acc, 'balanced_accuracy': bal_acc, 'auc': auc, 'f1_score': f1}
-        # Save metrics
-        pd.DataFrame([results[name]]).to_csv(os.path.join(config.RESULT_DIR, f"evaluation/{name}_metrics.csv"), index=False)
-        # Save predictions
-        pred_df = pd.DataFrame({'true': labels, 'pred_prob_C2': [p[1] for p in probs]})
-        pred_df.to_csv(os.path.join(config.RESULT_DIR, f"evaluation/{name}_predictions.csv"), index=False)
-        # ROC data
-        fpr, tpr, _ = roc_curve(labels, [p[1] for p in probs])
-        pd.DataFrame({'fpr': fpr, 'tpr': tpr}).to_csv(os.path.join(config.RESULT_DIR, f"evaluation/{name}_roc.csv"), index=False)
-
-    # Comparison table
-    comp = pd.DataFrame(results).T
-    comp.to_csv(os.path.join(config.RESULT_DIR, "evaluation/model_comparison.csv"))
-    print("\n=== Model Comparison ===")
-    print(comp)
 
 if __name__ == "__main__":
     main()

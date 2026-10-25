@@ -1,90 +1,84 @@
-import os
+"""Patch-specific Grad-CAM for correctly classified held-out CIS-AtN cases."""
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import argparse
+import json
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import cv2
 import matplotlib.pyplot as plt
-import pandas as pd
-from torch.utils.data import DataLoader
 import config
-from models.image_model import ImageModel
-from data.dataset import MultimodalDataset
+from pipeline.artifacts import load_checkpoint
+from pipeline.data import read_ids, read_labels
+from pipeline.dataset import PatientDataset, loader
+from pipeline.engine import predict
+
+
+def make_cams(model, images, target_class):
+    captured = []
+    def capture(module, inputs, output):
+        output.retain_grad()
+        captured.append(output)
+    handle = model.resnet[-2].register_forward_hook(capture)
+    try:
+        model.zero_grad(set_to_none=True)
+        output = model(images.requires_grad_(True))
+        output[0, target_class].backward()
+        features = captured[0]
+        # Keep the convolutional CHANNEL dimension until weighted summation.
+        weights = features.grad.mean(dim=(2, 3), keepdim=True)
+        cam = F.relu((weights * features).sum(dim=1, keepdim=True))
+        cam = F.interpolate(cam, size=images.shape[-2:], mode="bilinear", align_corners=False)
+        values = cam[:, 0].detach().cpu().numpy()
+        low, high = np.percentile(values, [5, 95], axis=(1, 2), keepdims=True)
+        return np.clip((values-low) / np.maximum(high-low, 1e-8), 0, 1)
+    finally:
+        handle.remove()
+
 
 def main():
-    save_dir = os.path.join(config.RESULT_DIR, "analysis/gradcam")
-    os.makedirs(save_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", default=str(Path(config.RESULT_DIR) / "image_model/best_model.pth"))
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--per-class", type=int, default=4)
+    args = parser.parse_args()
+    model, _, meta = load_checkpoint(args.checkpoint, "image", config.DEVICE)
+    ids = read_ids(Path(config.DATA_DIR) / "splits/test_ids.csv")
+    if meta.get("stage") != "final" or set(ids) != set(meta["evaluation_ids"]):
+        raise ValueError("Use the final model and original held-out patients")
+    ds = PatientDataset(ids, "image", False)
+    pred = predict(model, loader(ds), "image", config.DEVICE)
+    correct = pred.loc[(pred.pred_prob_C2 > .5).astype(int) == pred.true]
+    rng = np.random.default_rng(args.seed)
+    selected = []
+    for label in [0, 1]:
+        eligible = correct.loc[correct.true == label, "sample_id"].to_numpy()
+        if len(eligible) < args.per_class:
+            raise ValueError("Insufficient correctly classified cases for the requested stratified display")
+        selected.extend(rng.choice(eligible, args.per_class, replace=False).tolist())
+    args.output.mkdir(parents=True, exist_ok=False)
+    for sid in selected:
+        images, label = ds[ids.index(sid)]
+        cams = make_cams(model, images.unsqueeze(0).to(config.DEVICE), int(label))
+        np.savez_compressed(args.output / f"{sid}_cams.npz", cams=cams)
+        # Display the first frozen patch; save every patch CAM for inspection.
+        raw = images[0].permute(1, 2, 0).numpy() * config.IMAGENET_STD + config.IMAGENET_MEAN
+        raw = np.clip(raw, 0, 1)
+        overlay = .6*raw + .4*plt.get_cmap("viridis")(cams[0])[..., :3]
+        fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+        axes[0].imshow(raw); axes[1].imshow(overlay)
+        for ax in axes:
+            ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(args.output / f"{sid}_gradcam.png", dpi=300)
+        plt.close(fig)
+    (args.output / "selection.json").write_text(json.dumps(
+        {"case_ids": selected, "seed": args.seed, "correct_predictions_only": True,
+         "colormap": "viridis", "opacity": .4, "percentile_normalisation": [5, 95],
+         "scope": "unimodal image attribution, not cell-type or causal validation"}, indent=2), encoding="utf8")
 
-    # Load model
-    model = ImageModel().to(config.DEVICE)
-    state = torch.load(os.path.join(config.RESULT_DIR, "image_model/best_model.pth"), map_location='cpu')
-    state = {k.replace('module.', ''): v for k, v in state.items()}
-    model.load_state_dict(state)
-    model.eval()
-
-    # Select sample IDs (first 4 of each subtype)
-    labels_df = pd.read_csv(os.path.join(config.DATA_DIR, "labels/all_labels.csv"))
-    c1_ids = labels_df[labels_df.label==0]['sample_id'].tolist()[:4]
-    c2_ids = labels_df[labels_df.label==1]['sample_id'].tolist()[:4]
-    sample_ids = c1_ids + c2_ids
-
-    dataset = MultimodalDataset(sample_ids, mode='image', is_train=False)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
-
-    # Hook for Grad-CAM
-    features = []
-    grads = []
-    def forward_hook(module, inp, out):
-        features.append(out)
-        out.retain_grad()
-    def backward_hook(module, grad_in, grad_out):
-        grads.append(grad_out[0])
-
-    target_layer = model.resnet[-2][-1]  # last conv layer
-    fwd_handle = target_layer.register_forward_hook(forward_hook)
-    bwd_handle = target_layer.register_full_backward_hook(backward_hook)
-
-    results = []
-    for i, (patches, label) in enumerate(loader):
-        sid = sample_ids[i]
-        patches = patches.to(config.DEVICE)
-        logits = model(patches)
-        probs = F.softmax(logits, dim=1)
-        cls_idx = probs.argmax(1).item()
-        prob_c2 = probs[0,1].item()
-        # Backward
-        model.zero_grad()
-        logits[0, cls_idx].backward()
-
-        # Compute CAM
-        fmap = features[0].mean(dim=1)  # B, C, H, W -> B, H, W
-        gmap = grads[0].mean(dim=1)
-        weights = gmap.mean(dim=(1,2), keepdim=True)
-        cam = (weights * fmap).sum(dim=1, keepdim=True)
-        cam = F.relu(cam)
-        cam = F.interpolate(cam, size=(224,224), mode='bilinear', align_corners=False)
-        cam = cam[0,0].detach().cpu().numpy()
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-
-        # Visualization
-        img = patches[0,0].permute(1,2,0).cpu().numpy()
-        img = (img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])).clip(0,1)
-        heatmap = cv2.applyColorMap(np.uint8(255*cam), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-        overlay = 0.6 * img + 0.4 * heatmap
-
-        plt.figure(figsize=(8,4))
-        plt.subplot(1,2,1); plt.imshow(img); plt.axis('off'); plt.title('Original')
-        plt.subplot(1,2,2); plt.imshow(overlay); plt.axis('off'); plt.title('Grad-CAM')
-        plt.suptitle(f"{sid} | True: {label.item()} | Pred C2 prob: {prob_c2:.3f}")
-        plt.savefig(os.path.join(save_dir, f"{sid}_gradcam.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-
-        results.append({'sample_id': sid, 'true_label': label.item(), 'pred_prob_C2': prob_c2})
-
-    pd.DataFrame(results).to_csv(os.path.join(save_dir, "gradcam_results.csv"), index=False)
-    fwd_handle.remove()
-    bwd_handle.remove()
-    print("Grad-CAM analysis completed.")
 
 if __name__ == "__main__":
     main()

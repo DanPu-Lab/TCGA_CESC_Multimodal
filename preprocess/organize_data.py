@@ -1,42 +1,41 @@
-import os
-import pandas as pd
-from tqdm import tqdm
+"""Validate a curated patient manifest; never infer labels from missing suffixes."""
+from pathlib import Path
 import sys
-
-# 确保能导入外层的 config
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import argparse
+import pandas as pd
 import config
 
+
 def extract_label(folder_name):
-    """根据文件夹名称后缀判断标签，C1为0，C2为1"""
-    return 0 if folder_name.endswith("C1") else 1
+    if folder_name.endswith("-C1"):
+        return 0
+    if folder_name.endswith("-C2"):
+        return 1
+    raise ValueError(f"No explicit C1/C2 annotation: {folder_name}")
+
 
 def main():
-    print(f"Scanning raw data directory: {config.RAW_DATA_DIR}")
-    labels_dir = os.path.join(config.DATA_DIR, "labels")
-    os.makedirs(labels_dir, exist_ok=True)
-    
-    labels = []
-    # 假设你的原始数据存放在 config.RAW_DATA_DIR 下
-    if not os.path.exists(config.RAW_DATA_DIR):
-        raise FileNotFoundError(f"Raw data directory not found: {config.RAW_DATA_DIR}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True,
+                        help="CSV: sample_id,label,rna_path,wsi_path; one selected primary diagnostic WSI per patient")
+    args = parser.parse_args()
+    frame = pd.read_csv(args.manifest, dtype={"sample_id": str})
+    if not {"sample_id", "label", "rna_path", "wsi_path"} <= set(frame):
+        raise ValueError("Required columns: sample_id,label,rna_path,wsi_path")
+    if frame.sample_id.isna().any() or frame.sample_id.duplicated().any():
+        raise ValueError("Manifest must identify unique patients, not slides")
+    if not frame.label.isin([0, 1]).all():
+        raise ValueError("Reference labels must be C1=0, C2=1")
+    for column in ["rna_path", "wsi_path"]:
+        if not all(Path(path).is_file() for path in frame[column]):
+            raise ValueError(f"Missing files in {column}")
+    out = Path(config.DATA_DIR) / "labels/all_labels.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        raise FileExistsError(out)
+    frame[["sample_id", "label"]].to_csv(out, index=False)
 
-    for folder in tqdm(os.listdir(config.RAW_DATA_DIR), desc="Organizing labels"):
-        if not folder.startswith("TCGA"):
-            continue
-            
-        sample_id = "-".join(folder.split("-")[:3])
-        label = extract_label(folder)
-        labels.append({"sample_id": sample_id, "label": label})
-        
-    if not labels:
-        print("Warning: No TCGA folders found in raw data directory.")
-        return
-
-    df = pd.DataFrame(labels)
-    output_path = os.path.join(labels_dir, "all_labels.csv")
-    df.to_csv(output_path, index=False)
-    print(f"Successfully generated labels for {len(df)} samples at {output_path}")
 
 if __name__ == "__main__":
     main()
